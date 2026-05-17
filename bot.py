@@ -34,6 +34,9 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
 )
+# httpx logs every Telegram API call at INFO with the full URL — and the URL
+# contains the bot token. Bump to WARNING so the token never lands in logs.
+logging.getLogger("httpx").setLevel(logging.WARNING)
 log = logging.getLogger("bot")
 
 
