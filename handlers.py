@@ -16,8 +16,11 @@ from telegram.constants import ParseMode
 from telegram.ext import ContextTypes
 
 from config import (
+    ADMIN_TELEGRAM_ID,
     FREE_TIER_WALLET_LIMIT,
     PAID_TIER_WALLET_LIMIT,
+    PROMO_CODES,
+    REVIEW_CHANNEL,
     SUBSCRIPTION_DAYS,
     SUBSCRIPTION_PRICE_USDC,
     TREASURY_WALLET_ADDRESS,
@@ -27,8 +30,10 @@ from database import (
     count_user_wallets,
     create_pending_payment,
     ensure_user,
+    grant_paid_tier,
     is_paid,
     list_user_wallets,
+    record_redemption,
     remove_tracked_wallet,
 )
 from tax_export import export_user_csv
@@ -56,6 +61,7 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         "`/remove <address>` — stop tracking\n"
         "`/status` — show your plan\n"
         "`/upgrade` — upgrade to paid tier\n"
+        "`/redeem <CODE>` — redeem a promo code\n"
         "`/export` — download tax CSV (paid only)\n"
         "`/help` — show this message\n\n"
         f"Free tier: track up to *{FREE_TIER_WALLET_LIMIT}* wallets.\n"
@@ -195,6 +201,69 @@ async def upgrade(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         "⚠️ Must be USDC (not SOL). Must include the memo above — we use it to identify your payment."
     )
     await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
+
+
+async def redeem(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Redeem a promo code for free paid days. One use per user per code."""
+    await _register(update)
+    user = update.effective_user
+    user_id = user.id
+
+    if not ctx.args:
+        await update.message.reply_text(
+            "Usage: `/redeem <CODE>`\n\n"
+            f"Got a promo code from {REVIEW_CHANNEL}? Type it after /redeem.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+
+    code = ctx.args[0].strip().upper()
+    days = PROMO_CODES.get(code)
+    if not days:
+        await update.message.reply_text(
+            "❌ That code isn't valid. Double-check spelling — codes are case-insensitive."
+        )
+        return
+
+    recorded = await record_redemption(user_id, code, days)
+    if not recorded:
+        await update.message.reply_text(
+            "⚠️ You've already redeemed that code. One per customer!"
+        )
+        return
+
+    new_exp = await grant_paid_tier(user_id, days=days)
+    log.info(
+        "Promo redemption: user_id=%s username=%s code=%s days=%s new_expiry=%s",
+        user_id, user.username, code, days, new_exp.isoformat(),
+    )
+
+    months = days // 30
+    await update.message.reply_text(
+        f"🎉 *Promo redeemed!*\n\n"
+        f"You're now on the *paid plan* for *{months} months* "
+        f"(until *{new_exp.strftime('%Y-%m-%d')}*).\n\n"
+        f"📣 In return — please post a short honest review in {REVIEW_CHANNEL}. "
+        f"It's the single biggest way you can help this bot grow. Thanks 🙏\n\n"
+        f"Try `/add <wallet>` to start tracking up to {PAID_TIER_WALLET_LIMIT} wallets, "
+        f"or `/status` to see your plan.",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+
+    # Notify admin (so you can spot-check redemptions)
+    if ADMIN_TELEGRAM_ID:
+        try:
+            handle = f"@{user.username}" if user.username else f"id={user_id}"
+            await ctx.bot.send_message(
+                chat_id=ADMIN_TELEGRAM_ID,
+                text=(
+                    f"🎟 Redemption: {handle} used `{code}` "
+                    f"(+{days}d, expires {new_exp.strftime('%Y-%m-%d')})"
+                ),
+                parse_mode=ParseMode.MARKDOWN,
+            )
+        except Exception as e:
+            log.warning("Could not notify admin of redemption: %s", e)
 
 
 async def export(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
