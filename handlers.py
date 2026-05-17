@@ -204,7 +204,7 @@ async def upgrade(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def redeem(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    """Redeem a promo code for free paid days. One use per user per code."""
+    """Redeem a promo code for free paid days. One use per user per code; total cap optional."""
     await _register(update)
     user = update.effective_user
     user_id = user.id
@@ -218,31 +218,51 @@ async def redeem(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     code = ctx.args[0].strip().upper()
-    days = PROMO_CODES.get(code)
-    if not days:
+    promo = PROMO_CODES.get(code)
+    if not promo:
         await update.message.reply_text(
             "❌ That code isn't valid. Double-check spelling — codes are case-insensitive."
         )
         return
 
-    recorded = await record_redemption(user_id, code, days)
-    if not recorded:
+    days = promo["days"]
+    max_uses = promo.get("max_uses")  # None = unlimited
+
+    status_, count = await record_redemption(user_id, code, days, max_uses=max_uses)
+
+    if status_ == "already_redeemed":
         await update.message.reply_text(
             "⚠️ You've already redeemed that code. One per customer!"
         )
         return
 
+    if status_ == "sold_out":
+        await update.message.reply_text(
+            f"🥲 *Sorry — all {max_uses} early-bird spots have been claimed.*\n\n"
+            f"Watch {REVIEW_CHANNEL} for the next promo, or `/upgrade` to subscribe "
+            f"for *${SUBSCRIPTION_PRICE_USDC}/month*.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+
+    # status_ == "ok" — grant the days and confirm
     new_exp = await grant_paid_tier(user_id, days=days)
     log.info(
-        "Promo redemption: user_id=%s username=%s code=%s days=%s new_expiry=%s",
-        user_id, user.username, code, days, new_exp.isoformat(),
+        "Promo redemption: user_id=%s username=%s code=%s spot=%s/%s days=%s new_expiry=%s",
+        user_id, user.username, code, count, max_uses, days, new_exp.isoformat(),
     )
 
     months = days // 30
+    spot_line = ""
+    if max_uses is not None:
+        remaining = max_uses - count
+        spot_line = f"\n🎟 *Spot {count} of {max_uses}* — {remaining} left.\n"
+
     await update.message.reply_text(
         f"🎉 *Promo redeemed!*\n\n"
         f"You're now on the *paid plan* for *{months} months* "
-        f"(until *{new_exp.strftime('%Y-%m-%d')}*).\n\n"
+        f"(until *{new_exp.strftime('%Y-%m-%d')}*)."
+        f"{spot_line}\n"
         f"📣 In return — please post a short honest review in {REVIEW_CHANNEL}. "
         f"It's the single biggest way you can help this bot grow. Thanks 🙏\n\n"
         f"Try `/add <wallet>` to start tracking up to {PAID_TIER_WALLET_LIMIT} wallets, "
@@ -254,10 +274,11 @@ async def redeem(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if ADMIN_TELEGRAM_ID:
         try:
             handle = f"@{user.username}" if user.username else f"id={user_id}"
+            cap_str = f"{count}/{max_uses}" if max_uses is not None else f"#{count}"
             await ctx.bot.send_message(
                 chat_id=ADMIN_TELEGRAM_ID,
                 text=(
-                    f"🎟 Redemption: {handle} used `{code}` "
+                    f"🎟 Redemption {cap_str}: {handle} used `{code}` "
                     f"(+{days}d, expires {new_exp.strftime('%Y-%m-%d')})"
                 ),
                 parse_mode=ParseMode.MARKDOWN,
