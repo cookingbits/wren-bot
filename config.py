@@ -68,3 +68,13 @@ USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
 
 # How long a paid subscription lasts after successful payment
 SUBSCRIPTION_DAYS = 30
+
+# --- Promo codes ---
+# code → days granted. Codes are case-insensitive (handler upper-cases input).
+# To add or rotate a code, edit this dict and redeploy.
+PROMO_CODES: dict[str, int] = {
+    "COOKINGBITS3": 90,  # 3 months free for @cookingbits channel members (in exchange for a review)
+}
+
+# Channel users are asked to post a review in (shown in the /redeem reply)
+REVIEW_CHANNEL: str = os.getenv("REVIEW_CHANNEL", "@cookingbits")
