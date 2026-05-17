@@ -148,6 +148,7 @@ def main() -> None:
     app.add_handler(CommandHandler("list", handlers.list_wallets))
     app.add_handler(CommandHandler("status", handlers.status))
     app.add_handler(CommandHandler("upgrade", handlers.upgrade))
+    app.add_handler(CommandHandler("redeem", handlers.redeem))
     app.add_handler(CommandHandler("export", handlers.export))
 
     log.info("Starting Telegram bot — press Ctrl+C to stop")
