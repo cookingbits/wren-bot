@@ -6,6 +6,7 @@ Tables:
   tracked_wallets   — wallets a user wants to watch
   seen_transactions — every transaction we've already alerted on (dedup)
   payments          — pending & verified USDC payments
+  redemptions       — promo code redemptions (one row per user/code)
 """
 from __future__ import annotations
 
@@ -72,6 +73,15 @@ CREATE TABLE IF NOT EXISTS payments (
 );
 
 CREATE INDEX IF NOT EXISTS idx_payments_status ON payments(status);
+
+CREATE TABLE IF NOT EXISTS redemptions (
+    user_id      INTEGER NOT NULL,
+    code         TEXT NOT NULL,
+    days_granted INTEGER NOT NULL,
+    redeemed_at  TEXT NOT NULL,
+    PRIMARY KEY (user_id, code),
+    FOREIGN KEY (user_id) REFERENCES users(telegram_id) ON DELETE CASCADE
+);
 """
 
 
@@ -140,8 +150,10 @@ async def is_paid(telegram_id: int) -> bool:
     return expires_dt > datetime.now(timezone.utc)
 
 
-async def grant_paid_tier(telegram_id: int) -> datetime:
-    """Upgrade user to paid, extending subscription by SUBSCRIPTION_DAYS."""
+async def grant_paid_tier(telegram_id: int, days: Optional[int] = None) -> datetime:
+    """Upgrade user to paid, extending subscription by `days` (default SUBSCRIPTION_DAYS)."""
+    if days is None:
+        days = SUBSCRIPTION_DAYS
     user = await get_user(telegram_id)
     now = datetime.now(timezone.utc)
 
@@ -153,7 +165,7 @@ async def grant_paid_tier(telegram_id: int) -> datetime:
         except ValueError:
             current_exp = None
     base = current_exp if current_exp and current_exp > now else now
-    new_exp = base + timedelta(days=SUBSCRIPTION_DAYS)
+    new_exp = base + timedelta(days=days)
 
     async with aiosqlite.connect(DATABASE_PATH) as db:
         await db.execute(
@@ -337,3 +349,22 @@ async def mark_payment_verified(payment_id: int, tx_signature: str) -> None:
             (tx_signature, _now_iso(), payment_id),
         )
         await db.commit()
+
+
+# ---------------------------------------------------------------------------
+# Promo redemptions
+# ---------------------------------------------------------------------------
+
+async def record_redemption(user_id: int, code: str, days_granted: int) -> bool:
+    """Record a promo redemption. Returns False if user already redeemed this code."""
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        try:
+            await db.execute(
+                "INSERT INTO redemptions (user_id, code, days_granted, redeemed_at) "
+                "VALUES (?, ?, ?, ?)",
+                (user_id, code, days_granted, _now_iso()),
+            )
+            await db.commit()
+            return True
+        except aiosqlite.IntegrityError:
+            return False
