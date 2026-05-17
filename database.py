@@ -82,6 +82,8 @@ CREATE TABLE IF NOT EXISTS redemptions (
     PRIMARY KEY (user_id, code),
     FOREIGN KEY (user_id) REFERENCES users(telegram_id) ON DELETE CASCADE
 );
+
+CREATE INDEX IF NOT EXISTS idx_redemptions_code ON redemptions(code);
 """
 
 
@@ -355,16 +357,57 @@ async def mark_payment_verified(payment_id: int, tx_signature: str) -> None:
 # Promo redemptions
 # ---------------------------------------------------------------------------
 
-async def record_redemption(user_id: int, code: str, days_granted: int) -> bool:
-    """Record a promo redemption. Returns False if user already redeemed this code."""
+async def count_redemptions(code: str) -> int:
+    """Total successful redemptions for a given promo code, across all users."""
     async with aiosqlite.connect(DATABASE_PATH) as db:
+        async with db.execute(
+            "SELECT COUNT(*) FROM redemptions WHERE code = ?", (code,)
+        ) as cur:
+            row = await cur.fetchone()
+            return row[0] if row else 0
+
+
+async def record_redemption(
+    user_id: int,
+    code: str,
+    days_granted: int,
+    max_uses: Optional[int] = None,
+) -> tuple[str, int]:
+    """Atomically check the cap and insert a redemption row.
+
+    Returns (status, count) where:
+      status = 'ok'                — recorded; count is the user's 1-based spot number
+      status = 'already_redeemed'  — this user already redeemed this code; count = current total
+      status = 'sold_out'          — cap reached before insert; count = current total (== max_uses)
+
+    Atomicity: uses BEGIN IMMEDIATE so the count check + insert run inside a
+    single write transaction. Two concurrent redeems can't both squeeze past the cap.
+    """
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        await db.execute("BEGIN IMMEDIATE")
         try:
-            await db.execute(
-                "INSERT INTO redemptions (user_id, code, days_granted, redeemed_at) "
-                "VALUES (?, ?, ?, ?)",
-                (user_id, code, days_granted, _now_iso()),
-            )
-            await db.commit()
-            return True
-        except aiosqlite.IntegrityError:
-            return False
+            # Current total for this code
+            async with db.execute(
+                "SELECT COUNT(*) FROM redemptions WHERE code = ?", (code,)
+            ) as cur:
+                row = await cur.fetchone()
+                current = row[0] if row else 0
+
+            if max_uses is not None and current >= max_uses:
+                await db.execute("ROLLBACK")
+                return ("sold_out", current)
+
+            try:
+                await db.execute(
+                    "INSERT INTO redemptions (user_id, code, days_granted, redeemed_at) "
+                    "VALUES (?, ?, ?, ?)",
+                    (user_id, code, days_granted, _now_iso()),
+                )
+                await db.execute("COMMIT")
+                return ("ok", current + 1)
+            except aiosqlite.IntegrityError:
+                await db.execute("ROLLBACK")
+                return ("already_redeemed", current)
+        except Exception:
+            await db.execute("ROLLBACK")
+            raise
