@@ -120,6 +120,8 @@ async def payment_verifier_loop(bot: Bot) -> None:
 
 async def _post_init(app: Application) -> None:
     """Called after the Application is initialized but before polling starts."""
+    # Initialize DB inside PTB's event loop (avoids asyncio.run closing the loop)
+    await init_db()
     # Launch background workers as asyncio tasks tied to the app's event loop
     app.create_task(wallet_tracker_loop(app.bot))
     app.create_task(payment_verifier_loop(app.bot))
@@ -128,10 +130,6 @@ async def _post_init(app: Application) -> None:
 
 
 def main() -> None:
-    # Initialize DB synchronously before the app starts (safe — asyncio.run
-    # completes before we hand control to PTB's own event loop).
-    asyncio.run(init_db())
-
     app = (
         Application.builder()
         .token(TELEGRAM_BOT_TOKEN)
