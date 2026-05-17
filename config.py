@@ -70,10 +70,14 @@ USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
 SUBSCRIPTION_DAYS = 30
 
 # --- Promo codes ---
-# code → days granted. Codes are case-insensitive (handler upper-cases input).
-# To add or rotate a code, edit this dict and redeploy.
-PROMO_CODES: dict[str, int] = {
-    "COOKINGBITS3": 90,  # 3 months free for @cookingbits channel members (in exchange for a review)
+# code → {"days": <int>, "max_uses": <int|None>}
+# - days: how many days of paid tier this code grants
+# - max_uses: TOTAL redemption cap across all users (None = unlimited)
+# Per-user uniqueness (one redemption per user per code) is enforced separately
+# in the redemptions DB table. Codes are case-insensitive (handler upper-cases).
+PROMO_CODES: dict[str, dict[str, int]] = {
+    # First-20 early-bird promo for @cookingbits channel members
+    "COOKINGBITS3": {"days": 90, "max_uses": 20},
 }
 
 # Channel users are asked to post a review in (shown in the /redeem reply)
