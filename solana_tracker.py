@@ -81,11 +81,14 @@ def _format_transfer(t: dict[str, Any]) -> str:
 
 def _summarize_tx(tx: dict[str, Any], watched_address: str) -> str:
     """
-    Build a one-line human summary of a parsed transaction.
+    Build a human summary of a parsed transaction.
 
-    Helius provides `description` for common types, but it's not always
-    present and sometimes refers to counterparties not the watched wallet,
-    so we add our own fallback.
+    Output includes:
+      - SWAP / SENT / RECEIVED line
+      - Optional fee-payer note
+      - Token mint address(es) wrapped in backticks so Telegram renders them
+        as inline code (tap-to-copy on mobile). We include any mint where the
+        watched wallet was sender or receiver in this tx, in the order seen.
     """
     description = (tx.get("description") or "").strip()
     tx_type = tx.get("type") or "UNKNOWN"
@@ -94,10 +97,20 @@ def _summarize_tx(tx: dict[str, Any], watched_address: str) -> str:
     # Try to infer what happened to OUR watched address from tokenTransfers
     received: list[str] = []
     sent: list[str] = []
+    # Collect unique mints involving the watched wallet, in order of appearance
+    mints: list[str] = []
+    seen_mints: set[str] = set()
+
     for transfer in tx.get("tokenTransfers", []) or []:
-        if transfer.get("toUserAccount") == watched_address:
+        from_us = transfer.get("fromUserAccount") == watched_address
+        to_us = transfer.get("toUserAccount") == watched_address
+        mint = transfer.get("mint")
+        if (from_us or to_us) and mint and mint not in seen_mints:
+            mints.append(mint)
+            seen_mints.add(mint)
+        if to_us:
             received.append(_format_transfer(transfer))
-        elif transfer.get("fromUserAccount") == watched_address:
+        elif from_us:
             sent.append(_format_transfer(transfer))
 
     for transfer in tx.get("nativeTransfers", []) or []:
@@ -124,7 +137,15 @@ def _summarize_tx(tx: dict[str, Any], watched_address: str) -> str:
     if fee_payer and fee_payer != watched_address:
         parts.append(f"(fee payer: {fee_payer[:6]}…{fee_payer[-4:]})")
 
-    return " ".join(parts)
+    summary = " ".join(parts)
+
+    # Append mint addresses in tap-to-copy code format. Telegram MarkdownV1
+    # inline code (backticks) becomes a copy chip on mobile when tapped.
+    if mints:
+        mint_lines = "\n".join(f"`{m}`" for m in mints)
+        summary = f"{summary}\n\n{mint_lines}"
+
+    return summary
 
 
 def format_alert_message(alert: WalletAlert, label: Optional[str] = None) -> str:
