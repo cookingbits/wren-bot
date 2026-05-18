@@ -17,7 +17,7 @@ from datetime import datetime
 from telegram import Bot
 from telegram.constants import ParseMode
 from telegram.error import Forbidden, BadRequest
-from telegram.ext import Application, CommandHandler
+from telegram.ext import Application, CommandHandler, MessageHandler, filters
 
 import handlers
 from config import (
@@ -149,7 +149,12 @@ def main() -> None:
     app.add_handler(CommandHandler("status", handlers.status))
     app.add_handler(CommandHandler("upgrade", handlers.upgrade))
     app.add_handler(CommandHandler("redeem", handlers.redeem))
+    app.add_handler(CommandHandler("cancel", handlers.cancel))
     app.add_handler(CommandHandler("export", handlers.export))
+
+    # Plain-text catch-all: feeds the awaiting-state flow for /add and /redeem.
+    # Only triggers on non-command text messages; silently no-ops if no pending prompt.
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handlers.text_message))
 
     log.info("Starting Telegram bot — press Ctrl+C to stop")
     app.run_polling(allowed_updates=["message"])
