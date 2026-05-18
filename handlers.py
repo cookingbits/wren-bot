@@ -3,13 +3,21 @@ Telegram command handlers.
 
 Each function is registered with the python-telegram-bot Application in bot.py.
 All handlers are beginner-friendly — they guide the user with examples.
+
+UX patterns:
+  - Commands accept inline arguments: `/redeem CODE` and `/add ADDR [LABEL]`.
+  - If invoked with no arguments, the bot enters an "awaiting" state for that
+    user and the next plain-text message is treated as the argument.
+  - Awaiting state expires after AWAITING_TIMEOUT_SECONDS so stale prompts
+    don't accidentally consume unrelated messages later.
+  - /cancel clears any pending awaiting state.
 """
 from __future__ import annotations
 
 import io
 import logging
 import re
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from telegram import Update
 from telegram.constants import ParseMode
@@ -43,12 +51,49 @@ log = logging.getLogger(__name__)
 # Loose Solana address validation: base58, 32-44 chars.
 SOLANA_ADDRESS_RE = re.compile(r"^[1-9A-HJ-NP-Za-km-z]{32,44}$")
 
+# How long an "awaiting next message" prompt remains valid.
+AWAITING_TIMEOUT_SECONDS = 5 * 60
+
+# Keys used inside ctx.user_data
+_AWAITING_KEY = "awaiting"
+_AWAITING_SET_AT_KEY = "awaiting_set_at"
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 
 async def _register(update: Update) -> None:
     user = update.effective_user
     if user:
         await ensure_user(user.id, user.username)
 
+
+def _set_awaiting(ctx: ContextTypes.DEFAULT_TYPE, what: str) -> None:
+    """Mark this user as awaiting a follow-up message of a given kind."""
+    ctx.user_data[_AWAITING_KEY] = what
+    ctx.user_data[_AWAITING_SET_AT_KEY] = datetime.now(timezone.utc).isoformat()
+
+
+def _consume_awaiting(ctx: ContextTypes.DEFAULT_TYPE) -> str | None:
+    """Pop the awaiting state if present and not stale. Returns the kind or None."""
+    what = ctx.user_data.pop(_AWAITING_KEY, None)
+    set_at_raw = ctx.user_data.pop(_AWAITING_SET_AT_KEY, None)
+    if not what:
+        return None
+    if set_at_raw:
+        try:
+            set_at = datetime.fromisoformat(set_at_raw)
+            if datetime.now(timezone.utc) - set_at > timedelta(seconds=AWAITING_TIMEOUT_SECONDS):
+                return None
+        except ValueError:
+            return None
+    return what
+
+
+# ---------------------------------------------------------------------------
+# Basic commands
+# ---------------------------------------------------------------------------
 
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await _register(update)
@@ -63,7 +108,10 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         "`/upgrade` — upgrade to paid tier\n"
         "`/redeem <CODE>` — redeem a promo code\n"
         "`/export` — download tax CSV (paid only)\n"
+        "`/cancel` — abort the current prompt\n"
         "`/help` — show this message\n\n"
+        "💡 Tip: `/add` and `/redeem` also work without arguments — the bot "
+        "will ask, and your next message becomes the answer.\n\n"
         f"Free tier: track up to *{FREE_TIER_WALLET_LIMIT}* wallets.\n"
         f"Paid: *{PAID_TIER_WALLET_LIMIT}* wallets + tax CSV export + priority alerts, "
         f"*${SUBSCRIPTION_PRICE_USDC}/month*."
@@ -75,25 +123,53 @@ async def help_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await start(update, ctx)
 
 
+async def cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Clear any pending awaiting-state prompt."""
+    what = ctx.user_data.pop(_AWAITING_KEY, None)
+    ctx.user_data.pop(_AWAITING_SET_AT_KEY, None)
+    if what:
+        await update.message.reply_text("Cancelled.")
+    else:
+        await update.message.reply_text("Nothing to cancel.")
+
+
+# ---------------------------------------------------------------------------
+# /add — accept inline OR prompt for address
+# ---------------------------------------------------------------------------
+
 async def add_wallet(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await _register(update)
-    user_id = update.effective_user.id
 
-    if not ctx.args:
-        await update.message.reply_text(
-            "Usage: `/add <solana_address> [label]`\n\n"
-            "Example: `/add 5tzFkiKscXHK5ZXCGbXbH4eLTtQ1fFkA3YpzBsqnWXJz whale_1`",
-            parse_mode=ParseMode.MARKDOWN,
-        )
+    if ctx.args:
+        address = ctx.args[0].strip()
+        label = " ".join(ctx.args[1:]).strip() or None
+        await _do_add(update, ctx, address, label)
         return
 
-    address = ctx.args[0].strip()
-    label = " ".join(ctx.args[1:]).strip() or None
+    _set_awaiting(ctx, "wallet_address")
+    await update.message.reply_text(
+        "Send me the *wallet address* you want to track in your next message "
+        "(or /cancel).\n\n"
+        "Tip: you can also do it in one shot — `/add <address> [optional label]`",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+
+
+async def _do_add(
+    update: Update,
+    ctx: ContextTypes.DEFAULT_TYPE,
+    address: str,
+    label: str | None,
+) -> None:
+    """Validate and insert a tracked wallet. Shared by /add and the awaiting flow."""
+    user_id = update.effective_user.id
 
     if not SOLANA_ADDRESS_RE.match(address):
         await update.message.reply_text(
             "❌ That doesn't look like a valid Solana address. "
-            "Addresses are 32–44 characters, base58 (no 0, O, I, or l)."
+            "Addresses are 32–44 characters, base58 (no 0, O, I, or l).\n\n"
+            "Try again with `/add <address>` or send `/cancel`.",
+            parse_mode=ParseMode.MARKDOWN,
         )
         return
 
@@ -203,21 +279,37 @@ async def upgrade(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
 
 
+# ---------------------------------------------------------------------------
+# /redeem — accept inline OR prompt for code
+# ---------------------------------------------------------------------------
+
 async def redeem(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    """Redeem a promo code for free paid days. One use per user per code; total cap optional."""
+    """Redeem a promo code. Accepts inline arg or prompts for it."""
     await _register(update)
+
+    if ctx.args:
+        await _do_redeem(update, ctx, ctx.args[0].strip())
+        return
+
+    _set_awaiting(ctx, "redeem_code")
+    await update.message.reply_text(
+        f"Send me your *promo code* in your next message (or /cancel).\n\n"
+        f"Got one from {REVIEW_CHANNEL}? Drop it here. "
+        f"Tip: you can also do it in one shot — `/redeem <CODE>`.",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+
+
+async def _do_redeem(
+    update: Update,
+    ctx: ContextTypes.DEFAULT_TYPE,
+    raw_code: str,
+) -> None:
+    """Process a redeem attempt. Shared by /redeem and the awaiting flow."""
     user = update.effective_user
     user_id = user.id
 
-    if not ctx.args:
-        await update.message.reply_text(
-            "Usage: `/redeem <CODE>`\n\n"
-            f"Got a promo code from {REVIEW_CHANNEL}? Type it after /redeem.",
-            parse_mode=ParseMode.MARKDOWN,
-        )
-        return
-
-    code = ctx.args[0].strip().upper()
+    code = raw_code.strip().upper()
     promo = PROMO_CODES.get(code)
     if not promo:
         await update.message.reply_text(
@@ -226,7 +318,7 @@ async def redeem(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     days = promo["days"]
-    max_uses = promo.get("max_uses")  # None = unlimited
+    max_uses = promo.get("max_uses")
 
     status_, count = await record_redemption(user_id, code, days, max_uses=max_uses)
 
@@ -245,7 +337,7 @@ async def redeem(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         )
         return
 
-    # status_ == "ok" — grant the days and confirm
+    # status_ == "ok"
     new_exp = await grant_paid_tier(user_id, days=days)
     log.info(
         "Promo redemption: user_id=%s username=%s code=%s spot=%s/%s days=%s new_expiry=%s",
@@ -270,7 +362,6 @@ async def redeem(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         parse_mode=ParseMode.MARKDOWN,
     )
 
-    # Notify admin (so you can spot-check redemptions)
     if ADMIN_TELEGRAM_ID:
         try:
             handle = f"@{user.username}" if user.username else f"id={user_id}"
@@ -286,6 +377,34 @@ async def redeem(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         except Exception as e:
             log.warning("Could not notify admin of redemption: %s", e)
 
+
+# ---------------------------------------------------------------------------
+# Plain-text message router — consumes any pending awaiting state
+# ---------------------------------------------------------------------------
+
+async def text_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Catch-all for non-command text. Only acts if the user previously triggered
+    /add or /redeem without arguments and is still within the awaiting window.
+    Otherwise silently ignored.
+    """
+    awaiting = _consume_awaiting(ctx)
+    if not awaiting:
+        return
+
+    text = (update.message.text or "").strip()
+    if not text:
+        return
+
+    if awaiting == "redeem_code":
+        await _do_redeem(update, ctx, text)
+    elif awaiting == "wallet_address":
+        await _do_add(update, ctx, text, None)
+
+
+# ---------------------------------------------------------------------------
+# /export
+# ---------------------------------------------------------------------------
 
 async def export(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await _register(update)
