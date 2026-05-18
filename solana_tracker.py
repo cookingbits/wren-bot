@@ -7,10 +7,14 @@ For each tracked wallet we:
   3. For swap-style transactions, format a human-readable alert
   4. Mark as seen and return the alerts
 
-We use Helius's enhanced "Parse Transaction History" endpoint, which gives us
-structured swap events (tokenTransfers + nativeTransfers + description).
+Token symbol resolution: Helius's parsed-transactions response returns
+`tokenStandard: "Fungible"` rather than the actual token ticker, so we
+batch-resolve mint addresses to symbols via Helius DAS `getAssetBatch`
+and cache the results in-memory across polls.
 
-Docs: https://docs.helius.dev/solana-apis/enhanced-transactions-api
+Docs:
+  - https://docs.helius.dev/solana-apis/enhanced-transactions-api
+  - https://docs.helius.dev/compression-and-das-api/digital-asset-standard-das-api
 """
 from __future__ import annotations
 
@@ -22,7 +26,7 @@ from typing import Any, Optional
 
 import httpx
 
-from config import HELIUS_API_KEY, HELIUS_BASE_URL
+from config import HELIUS_API_KEY, HELIUS_BASE_URL, HELIUS_RPC_URL
 from database import (
     count_seen_for_address,
     get_all_tracked_addresses,
@@ -35,8 +39,9 @@ log = logging.getLogger(__name__)
 # Max transactions to fetch per wallet per poll (Helius max is 100)
 TX_PER_POLL = 25
 
-# How many transactions to always keep in DB even if not alerting
-# (first-run behavior: skip alerts for pre-existing tx, just mark seen)
+# In-memory cache: mint address -> resolved symbol (or "" if Helius had nothing).
+# Resets each deploy; warm-up is one extra Helius call per first-seen token.
+_symbol_cache: dict[str, str] = {}
 
 
 @dataclass
@@ -71,33 +76,98 @@ async def _fetch_address_history(
         return []
 
 
-def _format_transfer(t: dict[str, Any]) -> str:
-    """Format a single token transfer line."""
+async def _fetch_symbols(
+    client: httpx.AsyncClient, mints: list[str]
+) -> dict[str, str]:
+    """
+    Resolve a batch of mint addresses to token symbols via Helius DAS
+    `getAssetBatch`. Returns {mint: symbol}. Uses the module-level cache so
+    repeat mints across polls don't re-hit Helius.
+
+    Missing/empty symbols are cached as "" so we don't re-query forever.
+    """
+    if not mints:
+        return {}
+
+    # Split into cache hits and misses
+    to_fetch: list[str] = []
+    for m in mints:
+        if m not in _symbol_cache:
+            to_fetch.append(m)
+
+    if to_fetch:
+        # Helius getAssetBatch accepts up to 1000 ids per call; we batch in 100s
+        # to keep response sizes sane and parallelism modest.
+        for i in range(0, len(to_fetch), 100):
+            chunk = to_fetch[i : i + 100]
+            payload = {
+                "jsonrpc": "2.0",
+                "id": "wren-symbols",
+                "method": "getAssetBatch",
+                "params": {"ids": chunk},
+            }
+            try:
+                resp = await client.post(HELIUS_RPC_URL, json=payload, timeout=15.0)
+                resp.raise_for_status()
+                data = resp.json()
+                results = data.get("result") or []
+                # Index by id so missing ones still get cached as ""
+                by_id: dict[str, dict[str, Any]] = {}
+                for asset in results:
+                    if asset and asset.get("id"):
+                        by_id[asset["id"]] = asset
+                for mint in chunk:
+                    asset = by_id.get(mint)
+                    sym = ""
+                    if asset:
+                        meta = (asset.get("content") or {}).get("metadata") or {}
+                        sym = (meta.get("symbol") or "").strip()
+                    _symbol_cache[mint] = sym
+            except Exception as e:
+                log.warning("Helius getAssetBatch failed for %d mints: %s", len(chunk), e)
+                # Cache as "" so we don't retry every poll on a transient failure;
+                # next deploy will refresh. Acceptable tradeoff.
+                for mint in chunk:
+                    _symbol_cache.setdefault(mint, "")
+
+    return {m: _symbol_cache.get(m, "") for m in mints}
+
+
+def _short_mint(mint: str) -> str:
+    """Fallback display when no symbol is known."""
+    if not mint:
+        return "?"
+    return f"{mint[:4]}…"
+
+
+def _format_transfer(t: dict[str, Any], symbols: dict[str, str]) -> str:
+    """Format a single token transfer line, using resolved symbols where available."""
     amount = t.get("tokenAmount") or t.get("amount") or 0
-    symbol = t.get("tokenStandard") or t.get("mint", "")[:6] or "?"
-    # Helius sometimes provides tokenSymbol in richer data sources — fall back.
+    mint = t.get("mint", "")
+    symbol = symbols.get(mint) or _short_mint(mint)
     return f"{amount} {symbol}"
 
 
-def _summarize_tx(tx: dict[str, Any], watched_address: str) -> str:
+def _summarize_tx(
+    tx: dict[str, Any],
+    watched_address: str,
+    symbols: dict[str, str],
+) -> str:
     """
     Build a human summary of a parsed transaction.
 
     Output includes:
-      - SWAP / SENT / RECEIVED line
+      - SWAP / SENT / RECEIVED line with resolved token symbols
       - Optional fee-payer note
       - Token mint address(es) wrapped in backticks so Telegram renders them
-        as inline code (tap-to-copy on mobile). We include any mint where the
-        watched wallet was sender or receiver in this tx, in the order seen.
+        as inline code (tap-to-copy on mobile)
     """
     description = (tx.get("description") or "").strip()
     tx_type = tx.get("type") or "UNKNOWN"
     fee_payer = tx.get("feePayer", "")
 
-    # Try to infer what happened to OUR watched address from tokenTransfers
     received: list[str] = []
     sent: list[str] = []
-    # Collect unique mints involving the watched wallet, in order of appearance
     mints: list[str] = []
     seen_mints: set[str] = set()
 
@@ -109,9 +179,9 @@ def _summarize_tx(tx: dict[str, Any], watched_address: str) -> str:
             mints.append(mint)
             seen_mints.add(mint)
         if to_us:
-            received.append(_format_transfer(transfer))
+            received.append(_format_transfer(transfer, symbols))
         elif from_us:
-            sent.append(_format_transfer(transfer))
+            sent.append(_format_transfer(transfer, symbols))
 
     for transfer in tx.get("nativeTransfers", []) or []:
         amount_sol = (transfer.get("amount") or 0) / 1_000_000_000
@@ -139,8 +209,6 @@ def _summarize_tx(tx: dict[str, Any], watched_address: str) -> str:
 
     summary = " ".join(parts)
 
-    # Append mint addresses in tap-to-copy code format. Telegram MarkdownV1
-    # inline code (backticks) becomes a copy chip on mobile when tapped.
     if mints:
         mint_lines = "\n".join(f"`{m}`" for m in mints)
         summary = f"{summary}\n\n{mint_lines}"
@@ -169,8 +237,19 @@ async def poll_once() -> list[WalletAlert]:
     if not tracked:
         return []
 
+    # Per-cycle counters for the diagnostic log at the end
+    wallets_polled = 0
+    txs_fetched = 0
+    primed = 0
+    seen_skipped = 0
+    filtered_out = 0
     alerts: list[WalletAlert] = []
+
     async with httpx.AsyncClient() as client:
+        # First pass: fetch txs per wallet, collect mints to resolve in one batch.
+        per_wallet: list[tuple[str, list[int], list[dict[str, Any]], bool]] = []
+        all_mints: set[str] = set()
+
         for entry in tracked:
             address = entry["address"]
             chain = entry["chain"]
@@ -179,13 +258,27 @@ async def poll_once() -> list[WalletAlert]:
             if chain != "solana":
                 continue  # BSC/ETH come in a future version
 
-            # First-poll priming: if we've never seen any tx for this address,
-            # mark the current batch as seen without alerting. This prevents
-            # spamming users with ~25 "alerts" for historical activity the
-            # moment they add a new wallet.
+            wallets_polled += 1
             first_poll = (await count_seen_for_address(address)) == 0
-
             txs = await _fetch_address_history(client, address)
+            txs_fetched += len(txs)
+            per_wallet.append((address, user_ids, txs, first_poll))
+
+            # Gentle pacing between wallets to stay under Helius free-tier limits
+            await asyncio.sleep(0.15)
+
+            # Collect mints from interesting transfers for symbol lookup
+            for tx in txs:
+                for transfer in tx.get("tokenTransfers", []) or []:
+                    mint = transfer.get("mint")
+                    if mint:
+                        all_mints.add(mint)
+
+        # Batch-resolve symbols once for everything we just fetched.
+        symbols = await _fetch_symbols(client, sorted(all_mints))
+
+        # Second pass: build alerts using resolved symbols.
+        for address, user_ids, txs, first_poll in per_wallet:
             for tx in txs:
                 sig = tx.get("signature")
                 ts = tx.get("timestamp") or 0
@@ -193,23 +286,24 @@ async def poll_once() -> list[WalletAlert]:
                     continue
 
                 if first_poll:
-                    # Just record history so future polls can diff against it.
                     await mark_tx_seen(sig, address, ts, json.dumps(tx))
+                    primed += 1
                     continue
 
                 if await is_tx_seen(sig, address):
+                    seen_skipped += 1
                     continue
 
                 await mark_tx_seen(sig, address, ts, json.dumps(tx))
 
-                # Only alert on meaningful tx types
                 tx_type = (tx.get("type") or "").upper()
                 has_token = bool(tx.get("tokenTransfers"))
                 has_native = bool(tx.get("nativeTransfers"))
                 if not (has_token or has_native or tx_type in {"SWAP", "TRANSFER"}):
+                    filtered_out += 1
                     continue
 
-                summary = _summarize_tx(tx, address)
+                summary = _summarize_tx(tx, address, symbols)
                 alerts.append(
                     WalletAlert(
                         address=address,
@@ -220,7 +314,9 @@ async def poll_once() -> list[WalletAlert]:
                     )
                 )
 
-            # Gentle pacing to stay under Helius free-tier rate limits
-            await asyncio.sleep(0.15)
-
+    log.info(
+        "Poll cycle: wallets=%d txs=%d primed=%d seen=%d filtered=%d alerts=%d mints_resolved=%d",
+        wallets_polled, txs_fetched, primed, seen_skipped, filtered_out,
+        len(alerts), len(all_mints),
+    )
     return alerts
